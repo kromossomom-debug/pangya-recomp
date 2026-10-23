@@ -1,0 +1,24 @@
+#!/bin/sh
+# Pangya: Fantasy Golf (USA, ULUS10438) - game code statically recompiled to native x86-64.
+#
+# usage: pangya [path/to/iso]
+#   PANGYA_ISO=...        ISO location (default: ~/Downloads/Pangya - Fantasy Golf (USA).iso)
+#   PANGYA_WINDOWED=1     start in a window instead of full screen
+#   PPSSPP_RECOMP_DISABLE=1  run the game code on the interpreter instead (for comparison)
+
+HERE=$(dirname "$(readlink -f "$0")")
+ISO="${1:-${PANGYA_ISO:-$HOME/Downloads/Pangya - Fantasy Golf (USA).iso}}"
+DATA="${XDG_DATA_HOME:-$HOME/.local/share}/pangya-recomp"
+
+if [ ! -f "$ISO" ]; then
+	echo "pangya: ISO not found: $ISO" >&2
+	echo "pass the path as an argument or set PANGYA_ISO" >&2
+	exit 1
+fi
+mkdir -p "$DATA"
+
+SCREEN=--fullscreen
+[ -n "$PANGYA_WINDOWED" ] && SCREEN=--windowed
+
+# Saves and settings live in $DATA (its own memory stick), apart from any PPSSPP install.
+exec "$HERE/pangya-bin" --memstick="$DATA" --cpu=interpreter --pause-menu-exit "$SCREEN" "$ISO"

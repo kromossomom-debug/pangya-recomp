@@ -1,0 +1,17 @@
+# Everything derived from the game stays local.
+/gen/
+/work/
+/dist/
+*.iso
+*.cso
+*.png
+*.at3
+*.pmf
+*.bin
+*.elf
+*.ELF
+
+# Fetched and built.
+/runtime/ppsspp/
+/build/
+__pycache__/

@@ -1,0 +1,465 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 45b4971..23327d3 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -1812,3 +1812,28 @@ if(UNIX AND NOT ANDROID AND NOT APPLE)
+ 		DESTINATION "${CMAKE_INSTALL_DATAROOTDIR}/mime/packages"
+ 	)
+ endif()
++
++# Statically recompiled game code (tools/recomp.py output, see Core/Recomp/Recomp.h).
++set(RECOMP_GAME_DIR "" CACHE PATH "Directory of generated recompiled game sources")
++if(RECOMP_GAME_DIR)
++	file(GLOB RECOMP_GAME_SOURCES CONFIGURE_DEPENDS "${RECOMP_GAME_DIR}/*.cpp")
++	add_library(RecompGame OBJECT ${RECOMP_GAME_SOURCES})
++	target_include_directories(RecompGame PRIVATE ${CMAKE_SOURCE_DIR} ${RECOMP_GAME_DIR})
++	target_compile_options(RecompGame PRIVATE -O2 -ffp-contract=off -fno-strict-aliasing -w)
++	target_precompile_headers(RecompGame PRIVATE "${RECOMP_GAME_DIR}/recomp_rt.h")
++	foreach(RecompTarget ${TargetBin} PPSSPPHeadless)
++		if(TARGET ${RecompTarget})
++			target_sources(${RecompTarget} PRIVATE $<TARGET_OBJECTS:RecompGame>)
++		endif()
++	endforeach()
++endif()
++
++option(RECOMP_GLIBC_COMPAT "Link against baseline glibc symbol versions where newer ones were added" OFF)
++if(RECOMP_GLIBC_COMPAT AND LINUX)
++	foreach(RecompTarget ${TargetBin} PPSSPPHeadless)
++		if(TARGET ${RecompTarget})
++			target_sources(${RecompTarget} PRIVATE Core/Recomp/GlibcCompat.c)
++			target_link_options(${RecompTarget} PRIVATE "-Wl,--wrap=cosh,--wrap=sinh")
++		endif()
++	endforeach()
++endif()
+diff --git a/Core/CMakeLists.txt b/Core/CMakeLists.txt
+index 9a58593..4decf30 100644
+--- a/Core/CMakeLists.txt
++++ b/Core/CMakeLists.txt
+@@ -644,6 +644,8 @@ add_library(Core STATIC
+ 	MIPS/MIPSVFPUUtils.h
+ 	MIPS/MIPSTracer.cpp
+ 	MIPS/MIPSTracer.h
++	Recomp/Recomp.cpp
++	Recomp/Recomp.h
+ 	MIPS/MeCore.cpp
+ 	MIPS/MeCore.h
+ 	MIPS/JitCommon/JitCommon.cpp
+diff --git a/Core/HLE/sceKernelModule.cpp b/Core/HLE/sceKernelModule.cpp
+index a75b572..6ae1c07 100644
+--- a/Core/HLE/sceKernelModule.cpp
++++ b/Core/HLE/sceKernelModule.cpp
+@@ -65,6 +65,7 @@
+ #include "Core/Debugger/SymbolMap.h"
+ #include "Core/HLE/sceKernel.h"
+ #include "Core/HLE/sceKernelModule.h"
++#include "Core/Recomp/Recomp.h"
+ #include "Core/HLE/sceKernelThread.h"
+ #include "Core/HLE/sceKernelInterrupt.h"
+ #include "Core/HLE/PopsBoot.h"
+@@ -2526,6 +2527,7 @@ static bool __KernelLoadExecFromPtr(MIPSState * mips, const u8 *data, size_t siz
+ 	currentMIPS->pc = module->nm.entry_addr;
+ 
+ 	INFO_LOG(Log::Loader, "Module entry: %08x (%s %04x)", currentMIPS->pc, moduleName, moduleVersion);
++	Recomp_OnModuleLoaded(module, true);
+ 
+ 	SceKernelSMOption option;
+ 	option.size = sizeof(SceKernelSMOption);
+diff --git a/Core/MIPS/MIPSTables.cpp b/Core/MIPS/MIPSTables.cpp
+index 55604ce..61595ba 100644
+--- a/Core/MIPS/MIPSTables.cpp
++++ b/Core/MIPS/MIPSTables.cpp
+@@ -36,6 +36,7 @@
+ #include "Core/CoreTiming.h"
+ #include "Core/Reporting.h"
+ #include "Core/Debugger/Breakpoints.h"
++#include "Core/Recomp/Recomp.h"
+ 
+ #include "JitCommon/JitCommon.h"
+ 
+@@ -1467,7 +1468,10 @@ int MIPSInterpret_RunUntil(MIPSState *mips, u64 globalTicks) {
+ 		ApplyHostRoundingMode(mips);
+ 
+ 		uint64_t ticksLeft = globalTicks - CoreTiming::GetTicks(mips);
+-		if (g_breakpoints.HasBreakPoints() || g_breakpoints.HasMemChecks() || g_breakpoints.HasRegBreakpoints() || ticksLeft <= mips->downcount) {
++		const bool hasChecks = g_breakpoints.HasBreakPoints() || g_breakpoints.HasMemChecks() || g_breakpoints.HasRegBreakpoints();
++		if (!hasChecks && mips == &mipsr4k && Recomp_IsActive()) {
++			Recomp_RunUntilDowncountZero(mips);
++		} else if (hasChecks || ticksLeft <= mips->downcount) {
+ 			RunUntilDowncountZeroWithChecks(mips, globalTicks);
+ 		} else {
+ 			RunUntilDowncountZeroFast(mips);
+diff --git a/Core/Recomp/GlibcCompat.c b/Core/Recomp/GlibcCompat.c
+new file mode 100644
+index 0000000..26c96e1
+--- /dev/null
++++ b/Core/Recomp/GlibcCompat.c
+@@ -0,0 +1,11 @@
++// Lets a build made on a newer distro run on an older glibc (SteamOS): glibc 2.44 added new
++// versions of cosh/sinh, so bind to the baseline ones instead (linked with --wrap).
++#include <math.h>
++
++double cosh_compat(double x);
++double sinh_compat(double x);
++__asm__(".symver cosh_compat,cosh@GLIBC_2.2.5");
++__asm__(".symver sinh_compat,sinh@GLIBC_2.2.5");
++
++double __wrap_cosh(double x) { return cosh_compat(x); }
++double __wrap_sinh(double x) { return sinh_compat(x); }
+diff --git a/Core/Recomp/Recomp.cpp b/Core/Recomp/Recomp.cpp
+new file mode 100644
+index 0000000..fed6cd5
+--- /dev/null
++++ b/Core/Recomp/Recomp.cpp
+@@ -0,0 +1,272 @@
++// Copyright (c) 2012- PPSSPP Project.
++
++// This program is free software: you can redistribute it and/or modify
++// it under the terms of the GNU General Public License as published by
++// the Free Software Foundation, version 2.0 or later versions.
++
++// This program is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++// GNU General Public License 2.0 for more details.
++
++// A copy of the GPL 2.0 should have been included with the program.
++// If not, see http://www.gnu.org/licenses/
++
++// Official git repository and contact information can be found at
++// https://github.com/hrydgard/ppsspp and http://www.ppsspp.org/.
++
++#include <algorithm>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <string>
++#include <vector>
++
++#include "Common/Log.h"
++#include "Core/Core.h"
++#include "Core/MemMap.h"
++#include "Core/System.h"
++#include "Core/HLE/HLE.h"
++#include "Core/HLE/ReplaceTables.h"
++#include "Core/HLE/sceKernelModule.h"
++#include "Core/MIPS/MIPS.h"
++#include "Core/MIPS/MIPSTables.h"
++#include "Core/MIPS/InterpreterDispatch.h"
++#include "Core/Recomp/Recomp.h"
++
++// Overridden by the generated code when it's linked in.
++__attribute__((weak)) const RecompImage *Recomp_GetImage() {
++	return nullptr;
++}
++
++static const RecompImage *g_image = nullptr;
++static std::vector<RecompFunc> g_table;
++static std::vector<u8> g_offStorage;
++const u8 *g_recompOff = nullptr;
++static u32 g_base = 0;
++static u32 g_size = 0;
++static bool g_active = false;
++
++static u64 HashRange(u32 start, u32 end) {
++	u64 h = 0xcbf29ce484222325ULL;
++	for (u32 a = start; a < end; a++) {
++		h ^= Memory::ReadUnchecked_U8(a);
++		h *= 0x100000001b3ULL;
++	}
++	return h;
++}
++
++// Import stubs live at the end of .text and get rewritten whenever a module that exports
++// them is loaded, so they're left out of the hash (and left to the interpreter).
++static u32 FirstStubAddr(const PSPModule *module) {
++	u32 first = module->textEnd + 4;
++	for (const FuncSymbolImport &func : module->importedFuncs) {
++		if (func.stubAddr >= module->textStart && func.stubAddr < first)
++			first = func.stubAddr;
++	}
++	return first;
++}
++
++static void DumpModule(PSPModule *module, const char *dir) {
++	const u32 textStart = module->textStart;
++	const u32 textEnd = module->textEnd + 4;
++	const u32 blockEnd = module->memoryBlockAddr + module->memoryBlockSize;
++	const u32 imageEnd = std::max(textEnd, blockEnd);
++	const u32 stubStart = FirstStubAddr(module);
++
++	std::string base(dir);
++	FILE *f = fopen((base + "/image.bin").c_str(), "wb");
++	if (!f) {
++		ERROR_LOG(Log::Loader, "Recomp: can't write to %s", dir);
++		return;
++	}
++	fwrite(Memory::GetPointerUnchecked(textStart), 1, imageEnd - textStart, f);
++	fclose(f);
++
++	f = fopen((base + "/meta.txt").c_str(), "w");
++	fprintf(f, "name %s\n", module->nm.name);
++	fprintf(f, "image_start %08x\nimage_end %08x\n", textStart, imageEnd);
++	fprintf(f, "text_start %08x\ntext_end %08x\n", textStart, textEnd);
++	fprintf(f, "stub_start %08x\n", stubStart);
++	fprintf(f, "entry %08x\ngp %08x\n", (u32)module->nm.entry_addr, (u32)module->nm.gp_value);
++	fprintf(f, "hash %016llx\n", (unsigned long long)HashRange(textStart, stubStart));
++	for (const FuncSymbolImport &func : module->importedFuncs) {
++		fprintf(f, "import %08x %08x %s\n", func.stubAddr, func.nid, func.moduleName);
++	}
++	fclose(f);
++
++	// The interpreter's own view of each word, so the recompiler decodes exactly like it.
++	f = fopen((base + "/ops.txt").c_str(), "w");
++	for (u32 a = textStart; a < textEnd; a += 4) {
++		MIPSOpcode op(Memory::ReadUnchecked_U32(a));
++		MIPSInfo info = MIPSGetInfo(op);
++		fprintf(f, "%s %llx %d\n", MIPSGetName(op), (unsigned long long)info.value, (int)info.cycles);
++	}
++	fclose(f);
++	NOTICE_LOG(Log::Loader, "Recomp: dumped %s (%08x-%08x) to %s", module->nm.name, textStart, imageEnd, dir);
++}
++
++void Recomp_Shutdown() {
++	g_active = false;
++	g_image = nullptr;
++	g_table.clear();
++	g_offStorage.clear();
++	g_recompOff = nullptr;
++	g_base = 0;
++	g_size = 0;
++}
++
++void Recomp_OnModuleLoaded(PSPModule *module, bool isMainModule) {
++	if (!isMainModule || module->isFake)
++		return;
++	Recomp_Shutdown();
++
++	if (const char *dumpDir = getenv("PPSSPP_RECOMP_DUMP")) {
++		DumpModule(module, dumpDir);
++	}
++
++	const RecompImage *image = Recomp_GetImage();
++	if (!image)
++		return;
++	if (getenv("PPSSPP_RECOMP_DISABLE")) {
++		NOTICE_LOG(Log::Loader, "Recomp: disabled by PPSSPP_RECOMP_DISABLE");
++		return;
++	}
++	if (strncmp(module->nm.name, image->moduleName, sizeof(module->nm.name)) != 0) {
++		INFO_LOG(Log::Loader, "Recomp: module %s isn't %s, staying on the interpreter", module->nm.name, image->moduleName);
++		return;
++	}
++	if (module->textStart > image->hashStart || image->hashEnd > module->textEnd + 4) {
++		WARN_LOG(Log::Loader, "Recomp: %s loaded at %08x, but the code was generated for %08x", module->nm.name, module->textStart, image->base);
++		return;
++	}
++	const u64 hash = HashRange(image->hashStart, image->hashEnd);
++	if (hash != image->hash) {
++		WARN_LOG(Log::Loader, "Recomp: %s hash %016llx doesn't match the generated code's %016llx", module->nm.name, (unsigned long long)hash, (unsigned long long)image->hash);
++		return;
++	}
++
++	g_image = image;
++	g_base = image->base;
++	g_size = image->size;
++	if (const char *ranges = getenv("PPSSPP_RECOMP_OFF")) {
++		g_offStorage.assign(0x02000000 / 4, 0);
++		const char *p = ranges;
++		while (*p) {
++			char *endp = nullptr;
++			const u32 lo = (u32)strtoul(p, &endp, 16);
++			u32 hi = lo + 4;
++			if (*endp == '-')
++				hi = (u32)strtoul(endp + 1, &endp, 16);
++			for (u32 a = std::max(lo, 0x08000000U); a < hi && a < 0x0A000000; a += 4)
++				g_offStorage[(a - 0x08000000) >> 2] = 1;
++			p = *endp == ',' ? endp + 1 : endp;
++			if (endp == nullptr || (*endp != ',' && *endp != 0))
++				break;
++		}
++		g_recompOff = g_offStorage.data();
++		NOTICE_LOG(Log::Loader, "Recomp: functions in %s left to the interpreter", ranges);
++	}
++	g_table.assign(g_size / 4, nullptr);
++	for (u32 i = 0; i < image->numEntries; i++) {
++		const u32 off = image->entries[i].addr - g_base;
++		if (off < g_size && !Recomp_IsOff(image->entries[i].funcAddr))
++			g_table[off / 4] = image->entries[i].func;
++	}
++	if (PSP_CoreParameter().cpuCore != CPUCore::INTERPRETER) {
++		// The compiled code is driven from the interpreter's run loop.
++		mipsr4k.UpdateCore(CPUCore::INTERPRETER);
++	}
++	g_active = true;
++	NOTICE_LOG(Log::Loader, "Recomp: running %s natively (%u entries, %08x-%08x)", image->moduleName, image->numEntries, g_base, g_base + g_size);
++}
++
++bool Recomp_IsActive() {
++	return g_active;
++}
++
++RecompFunc Recomp_Lookup(u32 pc) {
++	const u32 off = pc - g_base;
++	if (off >= g_size || (pc & 3) != 0)
++		return nullptr;
++	RecompFunc f = g_table[off / 4];
++	// A replacement function or hook (see ReplaceTables) runs through the interpreter.
++	if (f && *Memory::GetBlockShadowEntry(pc) != 0)
++		return nullptr;
++	return f;
++}
++
++// Same as the interpreter's fast loop, but stops once it reaches compiled code. Never stops in
++// a delay slot: a thread switch there would lose the pending branch (thread contexts don't save it).
++static void InterpretUntilCompiled(MIPSState *mips, int maxSteps) {
++	while (true) {
++		const u32 pc = mips->pc;
++		if (!mips->space->IsValid4AlignedAddress(pc)) {
++			Core_ExecException(pc, pc, ExecExceptionType::JUMP);
++			return;
++		}
++		const MIPSOpcode op = ReadExecutedOp(*mips->space, pc);
++		const bool wasInDelaySlot = mips->inDelaySlot;
++		int cycles = ExecInstruction(mips, op);
++		if (cycles < 0) {
++			MIPSInterpret(mips, op);
++			cycles = MIPSGetInstructionCycleEstimate(op);
++		}
++		mips->downcount -= cycles;
++		if (mips->inDelaySlot && wasInDelaySlot) {
++			mips->pc = mips->nextPC;
++			mips->inDelaySlot = false;
++		}
++		if (mips->inDelaySlot && coreState == CORE_RUNNING_CPU)
++			continue;
++		if (mips->downcount < 0 || coreState != CORE_RUNNING_CPU || --maxSteps <= 0 || Recomp_Lookup(mips->pc))
++			return;
++	}
++}
++
++void Recomp_RunUntilDowncountZero(MIPSState *mips) {
++	while (mips->downcount >= 0 && coreState == CORE_RUNNING_CPU) {
++		RecompFunc f = mips->inDelaySlot ? nullptr : Recomp_Lookup(mips->pc);
++		if (!f) {
++			InterpretUntilCompiled(mips, 0x7FFFFFFF);
++			continue;
++		}
++		const u32 pc = mips->pc;
++		const int downcount = mips->downcount;
++		f(mips);
++		if (mips->pc == pc && mips->downcount == downcount && coreState == CORE_RUNNING_CPU) {
++			// No progress (an entry the function refused). Step past it.
++			InterpretUntilCompiled(mips, 1);
++		}
++	}
++}
++
++bool Recomp_TryStub(MIPSState *mips, u32 target) {
++	if (!Memory::IsValid4AlignedAddress(target) || *Memory::GetBlockShadowEntry(target) != 0)
++		return false;
++	const u32 w0 = Memory::ReadUnchecked_U32(target);
++	const u32 w1 = Memory::ReadUnchecked_U32(target + 4);
++	// jr ra / syscall, as written by the import resolver.
++	if (w0 != 0x03E00008 || (w1 & 0xFC00003F) != 0x0000000C)
++		return false;
++	// What the interpreter does for the pair: jr sets up the branch, and the syscall in its delay
++	// slot moves PC to the branch target before calling out (see Int_Syscall).
++	mips->downcount -= 2;
++	mips->pc = mips->r[MIPS_REG_RA];
++	RestoreHostRoundingMode();
++	CallSyscallWithPC(mips, MIPSOpcode(w1), target);
++	ApplyHostRoundingMode(mips);
++	return true;
++}
++
++void Recomp_BadEntry(MIPSState *mips, u32 funcAddr) {
++	static int count = 0;
++	if (count++ < 50) {
++		WARN_LOG(Log::CPU, "Recomp: entered function %08x at unknown pc %08x", funcAddr, mips->pc);
++	}
++}
++
++void Recomp_Interpret(MIPSState *mips, u32 pc, u32 op) {
++	mips->pc = pc;
++	MIPSInterpret(mips, MIPSOpcode(op));
++}
+diff --git a/Core/Recomp/Recomp.h b/Core/Recomp/Recomp.h
+new file mode 100644
+index 0000000..f26ed45
+--- /dev/null
++++ b/Core/Recomp/Recomp.h
+@@ -0,0 +1,74 @@
++// Copyright (c) 2012- PPSSPP Project.
++
++// This program is free software: you can redistribute it and/or modify
++// it under the terms of the GNU General Public License as published by
++// the Free Software Foundation, version 2.0 or later versions.
++
++// This program is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++// GNU General Public License 2.0 for more details.
++
++// A copy of the GPL 2.0 should have been included with the program.
++// If not, see http://www.gnu.org/licenses/
++
++// Official git repository and contact information can be found at
++// https://github.com/hrydgard/ppsspp and http://www.ppsspp.org/.
++
++// Static recompilation support. A game's main module is translated ahead of time to C++
++// (tools/recomp.py) and linked in. At load time the relocated module is hashed and compared
++// against the image the code was generated from; on a match, the interpreter's run loop hands
++// every PC that has a compiled entry to native code, and interprets everything else (HLE stubs,
++// other modules, anything the recompiler missed).
++
++#pragma once
++
++#include "Common/CommonTypes.h"
++
++class MIPSState;
++class PSPModule;
++
++typedef void (*RecompFunc)(MIPSState *mips);
++
++struct RecompEntry {
++	u32 addr;
++	u32 funcAddr;  // Start of the region (function) that owns this entry.
++	RecompFunc func;
++};
++
++struct RecompImage {
++	const char *moduleName;
++	u32 base;        // Address of the first word covered by the entry table.
++	u32 size;        // Bytes covered by the entry table.
++	u32 hashStart;   // Range hashed to validate the loaded module (excludes import stubs).
++	u32 hashEnd;
++	u64 hash;        // FNV-1a 64 over [hashStart, hashEnd).
++	const RecompEntry *entries;
++	u32 numEntries;
++};
++
++// Defined by the generated code. Weak fallback returns null.
++const RecompImage *Recomp_GetImage();
++
++void Recomp_OnModuleLoaded(PSPModule *module, bool isMainModule);
++void Recomp_Shutdown();
++bool Recomp_IsActive();
++
++// Runs guest code until the downcount runs out or the core leaves CORE_RUNNING_CPU.
++// The host must already be in the guest's rounding mode (see ApplyHostRoundingMode).
++void Recomp_RunUntilDowncountZero(MIPSState *mips);
++
++// Helpers for generated code.
++RecompFunc Recomp_Lookup(u32 pc);
++// Calls an import stub inline if it is a plain HLE syscall stub. On return, mips->pc says where to go.
++bool Recomp_TryStub(MIPSState *mips, u32 target);
++// Logs an entry into a compiled function at a PC it has no label for.
++void Recomp_BadEntry(MIPSState *mips, u32 funcAddr);
++// For bisecting translation bugs: PPSSPP_RECOMP_OFF=lo-hi[,lo-hi...] sends the functions starting
++// in those ranges to the interpreter. Checked on entry to every compiled function.
++extern const u8 *g_recompOff;
++inline bool Recomp_IsOff(u32 funcAddr) {
++	return g_recompOff && g_recompOff[(funcAddr - 0x08000000) >> 2];
++}
++// For instructions the generated code leaves to the interpreter.
++void Recomp_Interpret(MIPSState *mips, u32 pc, u32 op);
