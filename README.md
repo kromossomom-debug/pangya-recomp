@@ -108,3 +108,9 @@ Ahead-of-time recompiler that turns the PSP game's MIPS code into C++, linked in
 PPSSPP that acts as the platform runtime (HLE kernel, GE renderer, audio, I/O). Bring your own
 ISO: `./build.sh game.iso` fetches PPSSPP at the tested commit, applies the patch, dumps the
 module, recompiles it and builds `dist/pangya`. No game code or assets are included.
+
+## ☕ Apoie o projeto
+
+Curtiu o projeto? Pague um café para o autor e ajude a manter as atualizações.
+
+<a href="https://buymeacoffee.com/kromossomoc"><img src="https://img.shields.io/badge/Buy%20Me%20a%20Coffee-kromossomoc-FFDD00?style=for-the-badge&logo=buymeacoffee&logoColor=black" alt="Buy Me a Coffee: kromossomoc" height="36"></a>
